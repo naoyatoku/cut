@@ -18,11 +18,13 @@
 import math
 import csv
 import os
+import sys
 from dataclasses import dataclass
 
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")
+if "--show" not in sys.argv:   # --show 付きで実行するとウィンドウ表示(3Dを回転できる)
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # ============================================================
@@ -310,6 +312,66 @@ def plot_plan(plan: HopPlan, t, x, y, z, r_forbid, out_png):
     plt.close(fig)
 
 
+def plot_plan_3d(plan: HopPlan, t, x, y, z, r_forbid, out_png, show=False):
+    """禁止円筒(z_safe以下)・ウェハ円板・実軌跡の3D表示
+
+    Z軸は物理スケールだと潰れて見えないため誇張表示(軸ラベルに明記)。
+    """
+    fig = plt.figure(figsize=(11, 8))
+    ax = fig.add_subplot(projection="3d")
+    cx, cy = WAFER_CENTER
+
+    # ウェハ円板 (z=0)
+    th = np.linspace(0.0, 2.0 * np.pi, 80)
+    rr = np.linspace(0.0, WAFER_RADIUS, 2)
+    TH, RR = np.meshgrid(th, rr)
+    ax.plot_surface(cx + RR * np.cos(TH), cy + RR * np.sin(TH),
+                    np.zeros_like(TH), color="0.6", alpha=0.5,
+                    linewidth=0, shade=False)
+
+    # 禁止円筒の側面 (0 <= z <= z_safe, 半径 r_forbid)
+    ZZ = np.linspace(0.0, Z_SAFE, 2)
+    THc, ZC = np.meshgrid(th, ZZ)
+    ax.plot_surface(cx + r_forbid * np.cos(THc), cy + r_forbid * np.sin(THc),
+                    ZC, color="orange", alpha=0.25, linewidth=0, shade=False)
+    # 円筒の上縁 (z = z_safe)
+    ax.plot(cx + r_forbid * np.cos(th), cy + r_forbid * np.sin(th),
+            Z_SAFE * np.ones_like(th), "--", color="darkorange", lw=1.5,
+            label=f"禁止円筒上縁 z_safe={Z_SAFE}mm")
+
+    # 軌跡: 円内通過区間を色分け
+    if plan.t_enter >= 0:
+        inside = (t >= plan.t_enter) & (t <= plan.t_exit)
+        ax.plot(x[~inside & (t < plan.t_enter)], y[~inside & (t < plan.t_enter)],
+                z[~inside & (t < plan.t_enter)], "-", color="tab:green", lw=2,
+                label="軌跡(円外)")
+        ax.plot(x[inside], y[inside], z[inside], "-", color="tab:red", lw=2,
+                label="軌跡(円筒上空通過)")
+        ax.plot(x[t > plan.t_exit], y[t > plan.t_exit], z[t > plan.t_exit],
+                "-", color="tab:green", lw=2)
+    else:
+        ax.plot(x, y, z, "-", color="tab:green", lw=2, label="軌跡")
+
+    # 始点・終点
+    ax.scatter(*plan.A, color="tab:blue", s=50, label=f"A(カット終了)")
+    ax.scatter(*plan.B, color="tab:purple", s=50, label=f"B(次ライン開始)")
+
+    ax.set_xlabel("X [mm]")
+    ax.set_ylabel("Y [mm]")
+    ax.set_zlabel("Z [mm](誇張表示)")
+    ax.set_title(f"Zホップ3D軌跡  合計 {plan.total*1000:.1f} ms")
+    # XYは等縮尺、Zのみ誇張
+    ax.set_box_aspect((1.0, 1.0, 0.35))
+    ax.legend(loc="upper left", fontsize=9)
+    ax.view_init(elev=28, azim=-75)
+
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=110)
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
 # ============================================================
 # メイン: 片方向カットの戻りシナリオ
 # ============================================================
@@ -331,6 +393,9 @@ def main():
     out_dir = os.path.dirname(os.path.abspath(__file__))
     write_csv(os.path.join(out_dir, "hop_commands.csv"), t, x, y, z)
     plot_plan(plan, t, x, y, z, r_forbid, os.path.join(out_dir, "hop_plan.png"))
+    plot_plan_3d(plan, t, x, y, z, r_forbid,
+                 os.path.join(out_dir, "hop_plan_3d.png"),
+                 show=("--show" in sys.argv))
 
     print(f"A = {A}  ->  B = {B}")
     print(f"XY距離        : {plan.xy_prof.dist:.1f} mm")
@@ -342,7 +407,7 @@ def main():
     print(f"── 合計(逐次実行)      : {plan.total_sequential*1000:.1f} ms")
     print(f"── 短縮                : {(plan.total_sequential-plan.total)*1000:.1f} ms "
           f"({(1-plan.total/plan.total_sequential)*100:.0f}%)")
-    print(f"出力: hop_commands.csv ({len(t)}行 = {len(t)}ms分), hop_plan.png")
+    print(f"出力: hop_commands.csv ({len(t)}行 = {len(t)}ms分), hop_plan.png, hop_plan_3d.png")
 
 
 if __name__ == "__main__":
