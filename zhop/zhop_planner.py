@@ -24,11 +24,16 @@ from dataclasses import dataclass
 import numpy as np
 import matplotlib
 if "--show" in sys.argv:   # --show 付きで実行するとウィンドウ表示(3Dを回転できる)
-    try:
-        matplotlib.use("TkAgg")
-    except ImportError:
-        print("警告: TkAggバックエンドが使えないため --show は無効化されます"
-              "(tkinterが未インストールの可能性)。PNG出力のみ行います。")
+    for _backend in ("QtAgg", "Qt5Agg", "TkAgg"):
+        try:
+            matplotlib.use(_backend)
+            break
+        except (ImportError, ValueError):
+            continue
+    else:
+        print("警告: GUIバックエンド(QtAgg/Qt5Agg/TkAgg)が見つからないため"
+              " --show は無効化されます。PNG出力のみ行います。"
+              " (pip install PyQt5 を試してください)")
         matplotlib.use("Agg")
 else:
     matplotlib.use("Agg")
