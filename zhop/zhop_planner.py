@@ -23,7 +23,14 @@ from dataclasses import dataclass
 
 import numpy as np
 import matplotlib
-if "--show" not in sys.argv:   # --show 付きで実行するとウィンドウ表示(3Dを回転できる)
+if "--show" in sys.argv:   # --show 付きで実行するとウィンドウ表示(3Dを回転できる)
+    try:
+        matplotlib.use("TkAgg")
+    except ImportError:
+        print("警告: TkAggバックエンドが使えないため --show は無効化されます"
+              "(tkinterが未インストールの可能性)。PNG出力のみ行います。")
+        matplotlib.use("Agg")
+else:
     matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
