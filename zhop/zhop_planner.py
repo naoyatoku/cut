@@ -23,20 +23,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import matplotlib
-if "--show" in sys.argv:   # --show 付きで実行するとウィンドウ表示(3Dを回転できる)
-    for _backend in ("QtAgg", "Qt5Agg", "TkAgg"):
-        try:
-            matplotlib.use(_backend)
-            break
-        except (ImportError, ValueError):
-            continue
-    else:
-        print("警告: GUIバックエンド(QtAgg/Qt5Agg/TkAgg)が見つからないため"
-              " --show は無効化されます。PNG出力のみ行います。"
-              " (pip install PyQt5 を試してください)")
-        matplotlib.use("Agg")
-else:
-    matplotlib.use("Agg")
+matplotlib.use("Agg")   # PNG保存はGUIツールキット(Tk/Qt)に依存させない
 import matplotlib.pyplot as plt
 
 # ============================================================
@@ -342,8 +329,8 @@ def plot_plan(plan: HopPlan, t, x, y, z, r_forbid, out_png):
     plt.close(fig)
 
 
-def plot_plan_3d(plan: HopPlan, t, x, y, z, r_forbid, out_png, show=False):
-    """禁止円筒(z_safe以下)・ウェハ円板・実軌跡の3D表示
+def plot_plan_3d(plan: HopPlan, t, x, y, z, r_forbid, out_png):
+    """禁止円筒(z_safe以下)・ウェハ円板・実軌跡の3D表示(静止画PNG)
 
     Z軸は物理スケールだと潰れて見えないため誇張表示(軸ラベルに明記)。
     """
@@ -397,9 +384,79 @@ def plot_plan_3d(plan: HopPlan, t, x, y, z, r_forbid, out_png, show=False):
 
     fig.tight_layout()
     fig.savefig(out_png, dpi=110)
-    if show:
-        plt.show()
     plt.close(fig)
+
+
+def show_plan_3d_html(plan: HopPlan, t, x, y, z, r_forbid, out_html, auto_open=True):
+    """禁止円筒・ウェハ円板・実軌跡をブラウザで回せるインタラクティブ3D(Plotly)で出力
+
+    Tk/Qt等のGUIツールキットに依存しないため、それらが未導入/動作不良の環境でも
+    ブラウザさえあれば確実に表示できる。
+    """
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        print("警告: plotlyが未インストールのためインタラクティブ3D表示をスキップします。"
+              " `pip install plotly` を実行してください。")
+        return
+
+    cx, cy = WAFER_CENTER
+    th = np.linspace(0.0, 2.0 * np.pi, 80)
+
+    fig = go.Figure()
+
+    # ウェハ円板 (z=0)
+    rr = np.linspace(0.0, WAFER_RADIUS, 2)
+    TH, RR = np.meshgrid(th, rr)
+    fig.add_surface(x=cx + RR * np.cos(TH), y=cy + RR * np.sin(TH), z=np.zeros_like(TH),
+                     colorscale=[[0, "gray"], [1, "gray"]], showscale=False, opacity=0.5,
+                     name="ウェハ", showlegend=True)
+
+    # 禁止円筒の側面 (0 <= z <= z_safe)
+    ZZ = np.linspace(0.0, Z_SAFE, 2)
+    THc, ZC = np.meshgrid(th, ZZ)
+    fig.add_surface(x=cx + r_forbid * np.cos(THc), y=cy + r_forbid * np.sin(THc), z=ZC,
+                     colorscale=[[0, "orange"], [1, "orange"]], showscale=False, opacity=0.25,
+                     name="禁止円筒", showlegend=True)
+    fig.add_scatter3d(x=cx + r_forbid * np.cos(th), y=cy + r_forbid * np.sin(th),
+                       z=Z_SAFE * np.ones_like(th), mode="lines",
+                       line=dict(color="darkorange", width=4, dash="dash"),
+                       name=f"禁止円筒上縁 z_safe={Z_SAFE}mm")
+
+    # 軌跡: 円内通過区間を色分け
+    if plan.t_enter >= 0:
+        inside = (t >= plan.t_enter) & (t <= plan.t_exit)
+        before = ~inside & (t < plan.t_enter)
+        after = t > plan.t_exit
+        fig.add_scatter3d(x=x[before], y=y[before], z=z[before], mode="lines",
+                           line=dict(color="green", width=6), name="軌跡(円外)",
+                           legendgroup="out")
+        fig.add_scatter3d(x=x[inside], y=y[inside], z=z[inside], mode="lines",
+                           line=dict(color="red", width=6), name="軌跡(円筒上空通過)")
+        fig.add_scatter3d(x=x[after], y=y[after], z=z[after], mode="lines",
+                           line=dict(color="green", width=6), showlegend=False,
+                           legendgroup="out")
+    else:
+        fig.add_scatter3d(x=x, y=y, z=z, mode="lines",
+                           line=dict(color="green", width=6), name="軌跡")
+
+    fig.add_scatter3d(x=[plan.A[0]], y=[plan.A[1]], z=[plan.A[2]], mode="markers",
+                       marker=dict(color="blue", size=5), name="A(カット終了)")
+    fig.add_scatter3d(x=[plan.B[0]], y=[plan.B[1]], z=[plan.B[2]], mode="markers",
+                       marker=dict(color="purple", size=5), name="B(次ライン開始)")
+
+    fig.update_layout(
+        title=f"Zホップ3D軌跡(インタラクティブ)  合計 {plan.total*1000:.1f} ms",
+        scene=dict(
+            xaxis_title="X [mm]", yaxis_title="Y [mm]",
+            zaxis_title="Z [mm](誇張表示)",
+            aspectmode="manual", aspectratio=dict(x=1, y=1, z=0.35),
+        ),
+        legend=dict(x=0.0, y=1.0),
+    )
+    fig.write_html(out_html, auto_open=auto_open)
+    print(f"[表示] {out_html} を{'ブラウザで開きました' if auto_open else '生成しました'}"
+          "(ドラッグで回転・スクロールでズームできます)")
 
 
 # ============================================================
@@ -423,9 +480,10 @@ def main():
     out_dir = os.path.dirname(os.path.abspath(__file__))
     write_csv(os.path.join(out_dir, "hop_commands.csv"), t, x, y, z)
     plot_plan(plan, t, x, y, z, r_forbid, os.path.join(out_dir, "hop_plan.png"))
-    plot_plan_3d(plan, t, x, y, z, r_forbid,
-                 os.path.join(out_dir, "hop_plan_3d.png"),
-                 show=("--show" in sys.argv))
+    plot_plan_3d(plan, t, x, y, z, r_forbid, os.path.join(out_dir, "hop_plan_3d.png"))
+    if "--show" in sys.argv:
+        show_plan_3d_html(plan, t, x, y, z, r_forbid,
+                          os.path.join(out_dir, "hop_plan_3d.html"))
 
     # 安全チェック: 円内で z >= z_safe が守れているか
     rr = np.hypot(x - WAFER_CENTER[0], y - WAFER_CENTER[1])
