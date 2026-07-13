@@ -31,9 +31,11 @@ import matplotlib.pyplot as plt
 # パラメータ(装置に合わせてここを書き換える)
 # ============================================================
 
-# 軸性能 [mm/s], [mm/s^2]  ※加速度は仮値
+# 軸性能 [mm/s]
 VMAX = {"x": 1000.0, "y": 200.0, "z": 50.0}
-AMAX = {"x": 5000.0, "y": 2000.0, "z": 500.0}   # ← 実機値に要差し替え
+# 各軸とも 100ms で最高速到達(ユーザー指定の加速時定数)
+T_ACC = 0.100
+AMAX = {ax: v / T_ACC for ax, v in VMAX.items()}  # X=10000, Y=2000, Z=500 mm/s^2
 
 # パルス変換係数 [pulse/mm] ※仮値。実機の電子ギア比に合わせる
 PULSES_PER_MM = {"x": 1000.0, "y": 1000.0, "z": 1000.0}
@@ -130,12 +132,17 @@ class HopPlan:
     xy_dir: tuple          # 単位ベクトル
     up_prof: Trapezoid     # zA -> z_safe
     down_prof: Trapezoid   # z_safe -> zB
-    xy_delay: float        # XY開始遅延
-    t_down_start: float    # Z下降開始時刻(絶対)
-    t_enter: float         # 禁止円進入時刻(絶対, 交差なしは -1)
+    z_head: float          # Z上昇の先行開始時間(A到達の何s前に開始するか)
+    t_down_start: float    # Z下降開始時刻(t=0 は XY開始 = A出発)
+    t_enter: float         # 禁止円進入時刻(交差なしは -1)
     t_exit: float
-    total: float
+    total: float           # A出発からZ下降完了までの時間
     total_sequential: float
+
+    @property
+    def down_tail(self) -> float:
+        """XY完了後にZ下降が残る時間(次ラインの助走中に下降を継続できる)"""
+        return max(0.0, self.t_down_start + self.down_prof.T - self.xy_prof.T)
 
 
 def plan_hop(A, B, center, r_forbid, z_safe) -> HopPlan:
@@ -188,24 +195,32 @@ def plan_hop(A, B, center, r_forbid, z_safe) -> HopPlan:
     t_enter_rel = xy_prof.time_at_s(s_enter)
     t_exit_rel = xy_prof.time_at_s(s_exit)
 
-    # XY開始遅延: 円進入までに Z 上昇完了が必要
-    xy_delay = max(0.0, up_prof.T - t_enter_rel)
-    t_enter_abs = xy_delay + t_enter_rel
-    t_exit_abs = xy_delay + t_exit_rel
+    # Z上昇の先行開始(ユーザー承認済み):
+    # カット終端のオーバートラベル走行中(刃はウェハ外)に Z上昇を始めてよいので
+    # XY開始遅延は常にゼロ。z_head = A到達の何s前に上昇開始が必要か。
+    # ※カット終端の x=+r_forbid→A の走行時間が z_head 以上あることは要確認
+    #   (カット送り速度に依存)。不足する場合はその分だけXY開始が遅れる。
+    z_head = max(0.0, up_prof.T - t_enter_rel)
 
-    # Z下降は円退出と同時に開始
-    t_down_start = t_exit_abs
-    total = max(xy_delay + xy_prof.T, t_down_start + down_prof.T)
+    # Z下降は円退出と同時に開始。XY完了後に残る下降テール(down_tail)は
+    # 次ラインの助走(オーバートラベル)中に継続してよい(ユーザー承認済み)
+    t_down_start = t_exit_rel
+    total = max(xy_prof.T, t_down_start + down_prof.T)
 
     return HopPlan(A, B, xy_prof, (ux, uy), up_prof, down_prof,
-                   xy_delay, t_down_start, t_enter_abs, t_exit_abs,
+                   z_head, t_down_start, t_enter_rel, t_exit_rel,
                    total, seq)
 
 
 def sample_plan(plan: HopPlan, dt: float = RTEX_DT):
-    """1ms周期で各軸位置をサンプリング"""
-    n = int(math.ceil(plan.total / dt)) + 1
-    t = np.arange(n + 1) * dt
+    """1ms周期で各軸位置をサンプリング
+
+    t=0 が XY開始(A出発)。z_head > 0 の場合は t<0 の行(Z先行上昇、XY増分ゼロ)
+    を含む。この区間の dz はカット終端の指令列に合成して使う。
+    """
+    n_head = int(math.ceil(plan.z_head / dt))
+    n_main = int(math.ceil(plan.total / dt)) + 1
+    t = np.arange(-n_head, n_main + 1) * dt
     ax_, ay, az = plan.A
     bx, by, bz = plan.B
     ux, uy = plan.xy_dir
@@ -214,7 +229,7 @@ def sample_plan(plan: HopPlan, dt: float = RTEX_DT):
     y = np.empty_like(t)
     z = np.empty_like(t)
     for i, ti in enumerate(t):
-        s = plan.xy_prof.s(ti - plan.xy_delay)
+        s = plan.xy_prof.s(ti)
         x[i] = ax_ + ux * s
         y[i] = ay + uy * s
         if plan.t_enter < 0:
@@ -223,7 +238,7 @@ def sample_plan(plan: HopPlan, dt: float = RTEX_DT):
             z[i] = az + math.copysign(sz, bz - az) if plan.up_prof.dist > 0 else az
         else:
             if ti < plan.t_down_start:
-                z[i] = az + plan.up_prof.s(ti)
+                z[i] = az + plan.up_prof.s(ti + plan.z_head)
             else:
                 z[i] = (az + plan.up_prof.dist) - plan.down_prof.s(ti - plan.t_down_start)
     # 終端を厳密に一致させる
@@ -294,6 +309,9 @@ def plot_plan(plan: HopPlan, t, x, y, z, r_forbid, out_png):
     if plan.t_enter >= 0:
         a.axvspan(plan.t_enter * 1000, plan.t_exit * 1000, color="orange", alpha=0.15,
                   label="円内通過区間")
+    if plan.z_head > 0:
+        a.axvspan(-plan.z_head * 1000, 0, color="tab:blue", alpha=0.10,
+                  label="Z先行上昇(カット終端走行中)")
     a.set_xlabel("t [ms]"); a.set_ylabel("位置 [mm]")
     a.set_title("位置指令(1ms周期)")
     a.legend(); a.grid(alpha=0.3)
@@ -397,17 +415,28 @@ def main():
                  os.path.join(out_dir, "hop_plan_3d.png"),
                  show=("--show" in sys.argv))
 
+    # 安全チェック: 円内で z >= z_safe が守れているか
+    rr = np.hypot(x - WAFER_CENTER[0], y - WAFER_CENTER[1])
+    violation = np.any((rr < r_forbid - 1e-9) & (z < Z_SAFE - 1e-6))
+
     print(f"A = {A}  ->  B = {B}")
     print(f"XY距離        : {plan.xy_prof.dist:.1f} mm")
-    print(f"XY移動時間    : {plan.xy_prof.T*1000:.1f} ms (遅延 {plan.xy_delay*1000:.1f} ms)")
+    print(f"XY移動時間    : {plan.xy_prof.T*1000:.1f} ms (開始遅延なし)")
     print(f"Z上昇/下降    : {plan.up_prof.T*1000:.1f} / {plan.down_prof.T*1000:.1f} ms")
+    if plan.z_head > 0:
+        print(f"Z先行上昇     : A到達の {plan.z_head*1000:.1f} ms 前に開始"
+              f"(カット終端オーバートラベル走行がこの時間以上あること)")
     if plan.t_enter >= 0:
         print(f"円内通過区間  : {plan.t_enter*1000:.1f} - {plan.t_exit*1000:.1f} ms")
-    print(f"── 合計(オーバーラップ): {plan.total*1000:.1f} ms")
-    print(f"── 合計(逐次実行)      : {plan.total_sequential*1000:.1f} ms")
-    print(f"── 短縮                : {(plan.total_sequential-plan.total)*1000:.1f} ms "
-          f"({(1-plan.total/plan.total_sequential)*100:.0f}%)")
-    print(f"出力: hop_commands.csv ({len(t)}行 = {len(t)}ms分), hop_plan.png, hop_plan_3d.png")
+    if plan.down_tail > 0:
+        print(f"Z下降テール   : XY完了後 {plan.down_tail*1000:.1f} ms"
+              f"(次ラインの助走中に下降継続可)")
+    print(f"安全チェック  : {'NG! 円内で z < z_safe' if violation else 'OK(円内は常に z >= z_safe)'}")
+    print(f"── A→B所要(Z下降完了まで)   : {plan.total*1000:.1f} ms")
+    print(f"── 実効ライン間ロス(XY律速): {plan.xy_prof.T*1000:.1f} ms "
+          f"※Z先行上昇と下降テールを前後のカット走行に重ねた場合")
+    print(f"── 参考: 逐次実行           : {plan.total_sequential*1000:.1f} ms")
+    print(f"出力: hop_commands.csv ({len(t)}行, t<0はZ先行上昇分), hop_plan.png, hop_plan_3d.png")
 
 
 if __name__ == "__main__":
