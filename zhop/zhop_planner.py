@@ -51,6 +51,7 @@ Z_SAFE = 1.5                # ウェハ上面(z=0)からの退避高さ [mm]
 CUT_DEPTH = -0.8            # カット中の刃最下点 [mm](ウェハ上面基準)
 OVERTRAVEL = 10.0           # ウェハ縁からのオーバートラベル [mm]
 INDEX_PITCH = 5.0           # ラインピッチ [mm]
+CUT_FEED_SPEED = 50.0       # カット送り速度 [mm/s] ※仮値。可視化専用(実機値要確認)
 
 # ============================================================
 # 台形速度プロファイル
@@ -245,6 +246,52 @@ def sample_plan(plan: HopPlan, dt: float = RTEX_DT):
     return t, x, y, z
 
 
+def compute_cut_approach(plan: HopPlan, v_cut: float, overtravel: float, dt: float = RTEX_DT):
+    """可視化専用: カット終端のオーバートラベル走行を推定
+
+    実際のカット送り速度 v_cut [mm/s] で overtravel [mm] を等速走行し、
+    AMAX['x'] による減速で A にちょうど停止すると仮定した近似軌道。
+    hop_commands.csv には反映しない(実際のX制御はカット側の指令列が担うため)。
+    z_head=0(先行不要)の場合は空配列を返す。
+
+    戻り値: t, x, y, z (t=0 が A到達。負の値が A到達より前)
+    """
+    if plan.z_head <= 0.0 or v_cut <= 0.0:
+        empty = np.array([])
+        return empty, empty, empty, empty
+
+    ax_, ay, az = plan.A
+    ux, uy = plan.xy_dir
+    apx, apy = -ux, -uy  # カット進行方向(ホップ方向の逆)
+
+    amax_x = AMAX["x"]
+    t_dec = v_cut / amax_x
+    d_dec = min(0.5 * v_cut * t_dec, overtravel)
+    d_coast = max(0.0, overtravel - d_dec)
+    t_coast = d_coast / v_cut
+    T_pre = t_coast + t_dec
+
+    n = int(math.ceil(T_pre / dt))
+    t = -T_pre + dt * np.arange(n + 1)
+    t[-1] = 0.0  # A到達時刻を厳密に一致させる
+
+    x = np.empty_like(t)
+    y = np.empty_like(t)
+    z = np.empty_like(t)
+    for i, ti in enumerate(t):
+        s = ti + T_pre  # 区間開始からの経過時間 [0, T_pre]
+        if s < t_coast:
+            pos = v_cut * s
+        else:
+            u = s - t_coast
+            pos = d_coast + v_cut * u - 0.5 * amax_x * u * u
+        dist_remaining = overtravel - pos
+        x[i] = ax_ - apx * dist_remaining
+        y[i] = ay - apy * dist_remaining
+        z[i] = az + plan.up_prof.s(ti + plan.z_head)
+    return t, x, y, z
+
+
 def write_csv(path, t, x, y, z):
     """RTEX向け: 位置[mm]・1ms増分[mm]・パルス位置を出力"""
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -265,7 +312,10 @@ def write_csv(path, t, x, y, z):
                         round(z[i] * PULSES_PER_MM["z"])])
 
 
-def plot_plan(plan: HopPlan, t, x, y, z, r_forbid, out_png):
+def plot_plan(plan: HopPlan, t, x, y, z, r_forbid, out_png,
+              approach=None):
+    """approach: (t_ap, x_ap, y_ap, z_ap) があれば、カット終端アプローチの
+    推定軌道(可視化専用、破線)を重ねて描画する"""
     for name in ("MS Gothic", "Yu Gothic", "Meiryo"):
         try:
             matplotlib.rcParams["font.family"] = name
@@ -273,6 +323,10 @@ def plot_plan(plan: HopPlan, t, x, y, z, r_forbid, out_png):
         except Exception:
             pass
     matplotlib.rcParams["axes.unicode_minus"] = False
+
+    has_ap = approach is not None and len(approach[0]) > 0
+    if has_ap:
+        t_ap, x_ap, y_ap, z_ap = approach
 
     fig, axes = plt.subplots(2, 2, figsize=(13, 8))
 
@@ -282,10 +336,14 @@ def plot_plan(plan: HopPlan, t, x, y, z, r_forbid, out_png):
     a.add_patch(plt.Rectangle((cx - WAFER_RADIUS, -0.9), 2 * WAFER_RADIUS, 0.9,
                               color="0.75", label="ウェハ"))
     a.axhline(Z_SAFE, ls="--", color="gray", lw=1)
+    if has_ap:
+        a.plot(x_ap, z_ap, "--", color="tab:cyan", lw=1.5,
+               label=f"カット終端アプローチ(推定, v={CUT_FEED_SPEED:.0f}mm/s)")
     a.plot(x, z, "-", color="tab:green", lw=2)
     a.plot([plan.A[0], plan.B[0]], [plan.A[2], plan.B[2]], "o", color="tab:green")
     a.set_xlabel("X [mm]"); a.set_ylabel("Z [mm]")
     a.set_title("側面図 X-Z")
+    a.legend(fontsize=8)
     a.grid(alpha=0.3)
 
     # 上面図 (X-Y)
@@ -295,6 +353,8 @@ def plot_plan(plan: HopPlan, t, x, y, z, r_forbid, out_png):
            WAFER_CENTER[1] + WAFER_RADIUS * np.sin(th), color="0.6")
     a.plot(WAFER_CENTER[0] + r_forbid * np.cos(th),
            WAFER_CENTER[1] + r_forbid * np.sin(th), "--", color="0.6", lw=1)
+    if has_ap:
+        a.plot(x_ap, y_ap, "--", color="tab:cyan", lw=1.5)
     a.plot(x, y, "-", color="tab:green", lw=2)
     a.set_xlabel("X [mm]"); a.set_ylabel("Y [mm]")
     a.set_title("上面図 X-Y(破線=膨張フットプリント)")
@@ -302,6 +362,9 @@ def plot_plan(plan: HopPlan, t, x, y, z, r_forbid, out_png):
 
     # 位置時系列
     a = axes[1][0]
+    if has_ap:
+        a.plot(t_ap * 1000, x_ap, "--", color="tab:blue", lw=1, alpha=0.6)
+        a.plot(t_ap * 1000, z_ap * 50, "--", color="tab:green", lw=1, alpha=0.6)
     a.plot(t * 1000, x, label="X")
     a.plot(t * 1000, y, label="Y")
     a.plot(t * 1000, z * 50, label="Z ×50")
@@ -312,8 +375,8 @@ def plot_plan(plan: HopPlan, t, x, y, z, r_forbid, out_png):
         a.axvspan(-plan.z_head * 1000, 0, color="tab:blue", alpha=0.10,
                   label="Z先行上昇(カット終端走行中)")
     a.set_xlabel("t [ms]"); a.set_ylabel("位置 [mm]")
-    a.set_title("位置指令(1ms周期)")
-    a.legend(); a.grid(alpha=0.3)
+    a.set_title("位置指令(1ms周期、破線=カット終端アプローチ推定)")
+    a.legend(fontsize=8); a.grid(alpha=0.3)
 
     # 速度時系列(1ms差分)
     a = axes[1][1]
@@ -329,11 +392,17 @@ def plot_plan(plan: HopPlan, t, x, y, z, r_forbid, out_png):
     plt.close(fig)
 
 
-def plot_plan_3d(plan: HopPlan, t, x, y, z, r_forbid, out_png):
+def plot_plan_3d(plan: HopPlan, t, x, y, z, r_forbid, out_png, approach=None):
     """禁止円筒(z_safe以下)・ウェハ円板・実軌跡の3D表示(静止画PNG)
 
     Z軸は物理スケールだと潰れて見えないため誇張表示(軸ラベルに明記)。
+    approach: (t_ap, x_ap, y_ap, z_ap) があれば、カット終端アプローチの
+    推定軌道(可視化専用、破線)を重ねて描画する。
     """
+    has_ap = approach is not None and len(approach[0]) > 0
+    if has_ap:
+        _, x_ap, y_ap, z_ap = approach
+
     fig = plt.figure(figsize=(11, 8))
     ax = fig.add_subplot(projection="3d")
     cx, cy = WAFER_CENTER
@@ -369,6 +438,10 @@ def plot_plan_3d(plan: HopPlan, t, x, y, z, r_forbid, out_png):
     else:
         ax.plot(x, y, z, "-", color="tab:green", lw=2, label="軌跡")
 
+    if has_ap:
+        ax.plot(x_ap, y_ap, z_ap, "--", color="tab:cyan", lw=2,
+                label=f"カット終端アプローチ(推定, v={CUT_FEED_SPEED:.0f}mm/s)")
+
     # 始点・終点
     ax.scatter(*plan.A, color="tab:blue", s=50, label=f"A(カット終了)")
     ax.scatter(*plan.B, color="tab:purple", s=50, label=f"B(次ライン開始)")
@@ -387,11 +460,14 @@ def plot_plan_3d(plan: HopPlan, t, x, y, z, r_forbid, out_png):
     plt.close(fig)
 
 
-def show_plan_3d_html(plan: HopPlan, t, x, y, z, r_forbid, out_html, auto_open=True):
+def show_plan_3d_html(plan: HopPlan, t, x, y, z, r_forbid, out_html, auto_open=True,
+                       approach=None):
     """禁止円筒・ウェハ円板・実軌跡をブラウザで回せるインタラクティブ3D(Plotly)で出力
 
     Tk/Qt等のGUIツールキットに依存しないため、それらが未導入/動作不良の環境でも
     ブラウザさえあれば確実に表示できる。
+    approach: (t_ap, x_ap, y_ap, z_ap) があれば、カット終端アプローチの
+    推定軌道(可視化専用、破線)を重ねて描画する。
     """
     try:
         import plotly.graph_objects as go
@@ -440,6 +516,12 @@ def show_plan_3d_html(plan: HopPlan, t, x, y, z, r_forbid, out_html, auto_open=T
         fig.add_scatter3d(x=x, y=y, z=z, mode="lines",
                            line=dict(color="green", width=6), name="軌跡")
 
+    if approach is not None and len(approach[0]) > 0:
+        _, x_ap, y_ap, z_ap = approach
+        fig.add_scatter3d(x=x_ap, y=y_ap, z=z_ap, mode="lines",
+                           line=dict(color="cyan", width=5, dash="dash"),
+                           name=f"カット終端アプローチ(推定, v={CUT_FEED_SPEED:.0f}mm/s)")
+
     fig.add_scatter3d(x=[plan.A[0]], y=[plan.A[1]], z=[plan.A[2]], mode="markers",
                        marker=dict(color="blue", size=5), name="A(カット終了)")
     fig.add_scatter3d(x=[plan.B[0]], y=[plan.B[1]], z=[plan.B[2]], mode="markers",
@@ -476,14 +558,18 @@ def main():
 
     plan = plan_hop(A, B, WAFER_CENTER, r_forbid, Z_SAFE)
     t, x, y, z = sample_plan(plan)
+    approach = compute_cut_approach(plan, CUT_FEED_SPEED, OVERTRAVEL)
 
     out_dir = os.path.dirname(os.path.abspath(__file__))
     write_csv(os.path.join(out_dir, "hop_commands.csv"), t, x, y, z)
-    plot_plan(plan, t, x, y, z, r_forbid, os.path.join(out_dir, "hop_plan.png"))
-    plot_plan_3d(plan, t, x, y, z, r_forbid, os.path.join(out_dir, "hop_plan_3d.png"))
+    plot_plan(plan, t, x, y, z, r_forbid, os.path.join(out_dir, "hop_plan.png"),
+              approach=approach)
+    plot_plan_3d(plan, t, x, y, z, r_forbid, os.path.join(out_dir, "hop_plan_3d.png"),
+                 approach=approach)
     if "--show" in sys.argv:
         show_plan_3d_html(plan, t, x, y, z, r_forbid,
-                          os.path.join(out_dir, "hop_plan_3d.html"))
+                          os.path.join(out_dir, "hop_plan_3d.html"),
+                          approach=approach)
 
     # 安全チェック: 円内で z >= z_safe が守れているか
     rr = np.hypot(x - WAFER_CENTER[0], y - WAFER_CENTER[1])
@@ -496,6 +582,12 @@ def main():
     if plan.z_head > 0:
         print(f"Z先行上昇     : A到達の {plan.z_head*1000:.1f} ms 前に開始"
               f"(カット終端オーバートラベル走行がこの時間以上あること)")
+        if len(approach[0]) > 0:
+            t_pre = -approach[0][0] * 1000
+            margin = t_pre - plan.z_head * 1000
+            print(f"カット終端アプローチ推定: 送り{CUT_FEED_SPEED:.0f}mm/s・"
+                  f"オーバートラベル{OVERTRAVEL:.0f}mmなら走行 {t_pre:.1f} ms "
+                  f"確保可能({'OK, 余裕' if margin >= 0 else '不足'} {margin:+.1f} ms)")
     if plan.t_enter >= 0:
         print(f"円内通過区間  : {plan.t_enter*1000:.1f} - {plan.t_exit*1000:.1f} ms")
     if plan.down_tail > 0:
