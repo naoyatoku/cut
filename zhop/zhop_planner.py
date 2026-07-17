@@ -196,12 +196,11 @@ def plan_hop(A, B, center, r_forbid, z_safe) -> HopPlan:
     t_exit_rel = xy_prof.time_at_s(s_exit)
 
     # Z上昇の先行開始(ユーザー承認済み):
-    # 禁止円内はカット送りが常に等速のため、Z先行(z_head)はウェハ全域の
-    # 等速走行区間から自由に確保できる(短いオーバートラベル幅には制約されない)。
-    # 加減速は禁止円の外側(r_forbid〜A)でのみ行われる前提。
-    # XY開始遅延は常にゼロ。z_head = A到達の何s前に上昇開始が必要か。
-    # ※禁止円外での停止(A手前の減速)がそのマージン内に収まるかは
-    #   compute_cut_approach() 側で別途チェックする。
+    # 禁止円内は加工中(X等速・YZ固定)のため、Z上昇を開始できるのは刃が
+    # 禁止円を退出した後(オーバートラベルのマージン区間)のみ。
+    # z_head = A到達の何s前に上昇開始が必要か。これが「円退出→A停止」の
+    # 走行時間(t_avail)に収まるかは compute_cut_approach() 側でチェックする。
+    # 収まる場合はXY開始遅延ゼロ。不足分は実機ではXY開始遅延として戻る。
     z_head = max(0.0, up_prof.T - t_enter_rel)
 
     # Z下降は円退出と同時に開始。XY完了後に残る下降テール(down_tail)は
@@ -249,24 +248,26 @@ def sample_plan(plan: HopPlan, dt: float = RTEX_DT):
 
 
 def compute_cut_approach(plan: HopPlan, v_cut: float, overtravel: float, xy_margin: float,
-                          dt: float = RTEX_DT, display_lead: float = 0.03):
-    """可視化専用: カット終端(禁止円外側での減速→A停止)と、その手前の等速カット走行を推定
+                          dt: float = RTEX_DT, display_lead: float = 0.05):
+    """可視化専用: カット終端(禁止円退出→減速→A停止)と、その手前の加工中走行を推定
 
-    要件(ユーザー確認済み): 禁止円内(r < r_forbid)ではX軸は常に等速 v_cut で走行し、
-    加減速は禁止円の外側(r_forbid 〜 A、幅 = overtravel - xy_margin の"マージン")
-    でのみ行う。
-    したがって Z先行(z_head)は、実際にはウェハ全域にわたる等速カット走行の中から
-    自由に確保でき、この短いマージンの長さには制約されない(カット全長が
-    z_head 分の走行距離より十分長ければ常に成立する)。
-    減速がマージン内に収まるかどうかは、z_headとは独立の別問題として判定する
-    (info["decel_ok"])。
+    前提(ユーザー確認済み):
+      - 禁止円内は加工中。X軸は等速 v_cut、Y・Z軸は一切動かせない(刃がウェハ内)
+      - 刃が禁止円を出た後(x >= +r_forbid、幅 = overtravel - xy_margin のマージン)
+        でのみ、Xの減速と Z上昇が可能
+    したがって Z先行(z_head)は「禁止円退出→A停止」の走行時間 t_avail
+    (= マージンを等速+減速で走り切る時間)に収まる必要がある(info["z_head_ok"])。
+    収まらない場合、不足分は実機ではXY開始遅延として戻る。
+    減速距離がマージンに収まるかも併せて判定する(info["decel_ok"])。
     hop_commands.csv には反映しない(実際のX制御はカット側の指令列が担うため)。
     z_head=0(先行不要)の場合は空配列を返す。
 
     戻り値: t, x, y, z, info
-      t, x, y, z: t=0 が A到達、負の値が A到達より前(可視化用サンプル列)
-      info: {"margin": 減速に使える距離, "d_dec": 実際の停止に必要な距離,
-             "decel_ok": マージン内に収まるか}
+      t, x, y, z: t=0 が A到達、負の値が A到達より前(可視化用サンプル列。
+                  t < -t_avail の部分は加工中 = 禁止円内・Z固定)
+      info: {"t_avail": 円退出→A停止の時間, "z_head_ok": z_headが収まるか,
+             "head_margin": 時間余裕, "margin": マージン距離,
+             "d_dec": 停止に必要な距離, "decel_ok": 減速がマージンに収まるか}
     """
     if plan.z_head <= 0.0 or v_cut <= 0.0:
         empty = np.array([])
@@ -277,17 +278,20 @@ def compute_cut_approach(plan: HopPlan, v_cut: float, overtravel: float, xy_marg
     apx, apy = -ux, -uy  # カット進行方向(ホップ方向の逆)
 
     amax_x = AMAX["x"]
-    margin = overtravel - xy_margin  # 禁止円の外側、減速に使える距離
+    margin = overtravel - xy_margin  # 禁止円退出からAまでの距離
     t_dec = v_cut / amax_x
     d_dec = 0.5 * v_cut * t_dec
     decel_ok = d_dec <= margin
 
-    # 可視化用の等速区間: z_head 分 + 見やすさのための余白(実際の等速走行は
-    # ウェハ全域にわたるが、グラフには z_head を覆う分だけ描けば十分)
-    t_coast = plan.z_head + display_lead
-    d_coast = v_cut * t_coast
+    # 禁止円退出(Z上昇解禁)から A 停止までに使える時間
+    d_coast_out = max(0.0, margin - d_dec)   # 円外での等速走行分
+    t_avail = d_coast_out / v_cut + t_dec
+    z_head_ok = plan.z_head <= t_avail + 1e-12
+
+    # 可視化区間: 円退出の display_lead 秒前(加工中)から A まで
+    t_coast = d_coast_out / v_cut + display_lead  # 等速走行の総時間(加工中含む)
     T_pre = t_coast + t_dec
-    total_dist = d_coast + d_dec
+    total_dist = v_cut * t_coast + d_dec
 
     n = int(math.ceil(T_pre / dt))
     t = -T_pre + dt * np.arange(n + 1)
@@ -302,13 +306,19 @@ def compute_cut_approach(plan: HopPlan, v_cut: float, overtravel: float, xy_marg
             pos = v_cut * s
         else:
             u = s - t_coast
-            pos = d_coast + v_cut * u - 0.5 * amax_x * u * u
+            pos = v_cut * t_coast + v_cut * u - 0.5 * amax_x * u * u
         dist_remaining = total_dist - pos
         x[i] = ax_ - apx * dist_remaining
         y[i] = ay - apy * dist_remaining
-        z[i] = az + plan.up_prof.s(ti + plan.z_head)
+        # Z上昇は禁止円退出(ti >= -t_avail)後のみ。加工中(円内)は固定
+        if ti >= -t_avail:
+            z[i] = az + plan.up_prof.s(ti + plan.z_head)
+        else:
+            z[i] = az
 
-    info = {"margin": margin, "d_dec": d_dec, "decel_ok": decel_ok, "t_dec": t_dec}
+    info = {"t_avail": t_avail, "z_head_ok": z_head_ok,
+            "head_margin": t_avail - plan.z_head,
+            "margin": margin, "d_dec": d_dec, "decel_ok": decel_ok, "t_dec": t_dec}
     return t, x, y, z, info
 
 
@@ -394,6 +404,9 @@ def plot_plan(plan: HopPlan, t, x, y, z, r_forbid, out_png,
     if plan.z_head > 0:
         a.axvspan(-plan.z_head * 1000, 0, color="tab:blue", alpha=0.10,
                   label="Z先行上昇(カット終端走行中)")
+    if has_ap and _ap_info:
+        a.axvline(-_ap_info["t_avail"] * 1000, color="tab:red", lw=1, ls=":",
+                  label="刃が禁止円退出(これ以前は加工中・Z固定)")
     a.set_xlabel("t [ms]"); a.set_ylabel("位置 [mm]")
     a.set_title("位置指令(1ms周期、破線=カット終端アプローチ推定)")
     a.legend(fontsize=8); a.grid(alpha=0.3)
@@ -601,18 +614,19 @@ def main():
     print(f"Z上昇/下降    : {plan.up_prof.T*1000:.1f} / {plan.down_prof.T*1000:.1f} ms")
     if plan.z_head > 0:
         print(f"Z先行上昇     : A到達の {plan.z_head*1000:.1f} ms 前に開始"
-              f"(禁止円内は等速カット走行中のため、この時間はウェハ全域の"
-              f"等速区間から自由に確保可能)")
+              f"(開始できるのは刃が禁止円を退出した後のみ)")
         if len(approach) == 5 and approach[4]:
             info = approach[4]
-            ok = info["decel_ok"]
-            spare = (info["margin"] - info["d_dec"])
-            print(f"減速マージンチェック: 送り{CUT_FEED_SPEED:.0f}mm/s → 停止に"
-                  f"{info['d_dec']:.3f}mm必要 / 禁止円外マージン"
-                  f"{info['margin']:.1f}mm(=オーバートラベル{OVERTRAVEL:.0f}-"
-                  f"XYマージン{XY_MARGIN:.0f}) → "
-                  f"{'OK' if ok else 'NG! マージン不足'}"
-                  f"(余裕 {spare:+.2f}mm)")
+            print(f"円退出→A停止 : {info['t_avail']*1000:.1f} ms"
+                  f"(マージン{info['margin']:.1f}mm=オーバートラベル{OVERTRAVEL:.0f}"
+                  f"-XYマージン{XY_MARGIN:.0f} を送り{CUT_FEED_SPEED:.0f}mm/s"
+                  f"等速+減速で走行)")
+            print(f"z_head充足    : "
+                  f"{'OK' if info['z_head_ok'] else 'NG! 不足分はXY開始遅延として戻る'}"
+                  f"(時間余裕 {info['head_margin']*1000:+.1f} ms)")
+            print(f"減速距離      : {info['d_dec']:.3f} mm → "
+                  f"{'OK' if info['decel_ok'] else 'NG! マージン不足'}"
+                  f"(マージン{info['margin']:.1f}mm 内)")
     if plan.t_enter >= 0:
         print(f"円内通過区間  : {plan.t_enter*1000:.1f} - {plan.t_exit*1000:.1f} ms")
     if plan.down_tail > 0:
