@@ -196,10 +196,12 @@ def plan_hop(A, B, center, r_forbid, z_safe) -> HopPlan:
     t_exit_rel = xy_prof.time_at_s(s_exit)
 
     # Z上昇の先行開始(ユーザー承認済み):
-    # カット終端のオーバートラベル走行中(刃はウェハ外)に Z上昇を始めてよいので
+    # 禁止円内はカット送りが常に等速のため、Z先行(z_head)はウェハ全域の
+    # 等速走行区間から自由に確保できる(短いオーバートラベル幅には制約されない)。
+    # 加減速は禁止円の外側(r_forbid〜A)でのみ行われる前提。
     # XY開始遅延は常にゼロ。z_head = A到達の何s前に上昇開始が必要か。
-    # ※カット終端の x=+r_forbid→A の走行時間が z_head 以上あることは要確認
-    #   (カット送り速度に依存)。不足する場合はその分だけXY開始が遅れる。
+    # ※禁止円外での停止(A手前の減速)がそのマージン内に収まるかは
+    #   compute_cut_approach() 側で別途チェックする。
     z_head = max(0.0, up_prof.T - t_enter_rel)
 
     # Z下降は円退出と同時に開始。XY完了後に残る下降テール(down_tail)は
@@ -246,30 +248,46 @@ def sample_plan(plan: HopPlan, dt: float = RTEX_DT):
     return t, x, y, z
 
 
-def compute_cut_approach(plan: HopPlan, v_cut: float, overtravel: float, dt: float = RTEX_DT):
-    """可視化専用: カット終端のオーバートラベル走行を推定
+def compute_cut_approach(plan: HopPlan, v_cut: float, overtravel: float, xy_margin: float,
+                          dt: float = RTEX_DT, display_lead: float = 0.03):
+    """可視化専用: カット終端(禁止円外側での減速→A停止)と、その手前の等速カット走行を推定
 
-    実際のカット送り速度 v_cut [mm/s] で overtravel [mm] を等速走行し、
-    AMAX['x'] による減速で A にちょうど停止すると仮定した近似軌道。
+    要件(ユーザー確認済み): 禁止円内(r < r_forbid)ではX軸は常に等速 v_cut で走行し、
+    加減速は禁止円の外側(r_forbid 〜 A、幅 = overtravel - xy_margin の"マージン")
+    でのみ行う。
+    したがって Z先行(z_head)は、実際にはウェハ全域にわたる等速カット走行の中から
+    自由に確保でき、この短いマージンの長さには制約されない(カット全長が
+    z_head 分の走行距離より十分長ければ常に成立する)。
+    減速がマージン内に収まるかどうかは、z_headとは独立の別問題として判定する
+    (info["decel_ok"])。
     hop_commands.csv には反映しない(実際のX制御はカット側の指令列が担うため)。
     z_head=0(先行不要)の場合は空配列を返す。
 
-    戻り値: t, x, y, z (t=0 が A到達。負の値が A到達より前)
+    戻り値: t, x, y, z, info
+      t, x, y, z: t=0 が A到達、負の値が A到達より前(可視化用サンプル列)
+      info: {"margin": 減速に使える距離, "d_dec": 実際の停止に必要な距離,
+             "decel_ok": マージン内に収まるか}
     """
     if plan.z_head <= 0.0 or v_cut <= 0.0:
         empty = np.array([])
-        return empty, empty, empty, empty
+        return empty, empty, empty, empty, {}
 
     ax_, ay, az = plan.A
     ux, uy = plan.xy_dir
     apx, apy = -ux, -uy  # カット進行方向(ホップ方向の逆)
 
     amax_x = AMAX["x"]
+    margin = overtravel - xy_margin  # 禁止円の外側、減速に使える距離
     t_dec = v_cut / amax_x
-    d_dec = min(0.5 * v_cut * t_dec, overtravel)
-    d_coast = max(0.0, overtravel - d_dec)
-    t_coast = d_coast / v_cut
+    d_dec = 0.5 * v_cut * t_dec
+    decel_ok = d_dec <= margin
+
+    # 可視化用の等速区間: z_head 分 + 見やすさのための余白(実際の等速走行は
+    # ウェハ全域にわたるが、グラフには z_head を覆う分だけ描けば十分)
+    t_coast = plan.z_head + display_lead
+    d_coast = v_cut * t_coast
     T_pre = t_coast + t_dec
+    total_dist = d_coast + d_dec
 
     n = int(math.ceil(T_pre / dt))
     t = -T_pre + dt * np.arange(n + 1)
@@ -285,11 +303,13 @@ def compute_cut_approach(plan: HopPlan, v_cut: float, overtravel: float, dt: flo
         else:
             u = s - t_coast
             pos = d_coast + v_cut * u - 0.5 * amax_x * u * u
-        dist_remaining = overtravel - pos
+        dist_remaining = total_dist - pos
         x[i] = ax_ - apx * dist_remaining
         y[i] = ay - apy * dist_remaining
         z[i] = az + plan.up_prof.s(ti + plan.z_head)
-    return t, x, y, z
+
+    info = {"margin": margin, "d_dec": d_dec, "decel_ok": decel_ok, "t_dec": t_dec}
+    return t, x, y, z, info
 
 
 def write_csv(path, t, x, y, z):
@@ -326,7 +346,7 @@ def plot_plan(plan: HopPlan, t, x, y, z, r_forbid, out_png,
 
     has_ap = approach is not None and len(approach[0]) > 0
     if has_ap:
-        t_ap, x_ap, y_ap, z_ap = approach
+        t_ap, x_ap, y_ap, z_ap, _ap_info = approach
 
     fig, axes = plt.subplots(2, 2, figsize=(13, 8))
 
@@ -401,7 +421,7 @@ def plot_plan_3d(plan: HopPlan, t, x, y, z, r_forbid, out_png, approach=None):
     """
     has_ap = approach is not None and len(approach[0]) > 0
     if has_ap:
-        _, x_ap, y_ap, z_ap = approach
+        _, x_ap, y_ap, z_ap, _ap_info = approach
 
     fig = plt.figure(figsize=(11, 8))
     ax = fig.add_subplot(projection="3d")
@@ -517,7 +537,7 @@ def show_plan_3d_html(plan: HopPlan, t, x, y, z, r_forbid, out_html, auto_open=T
                            line=dict(color="green", width=6), name="軌跡")
 
     if approach is not None and len(approach[0]) > 0:
-        _, x_ap, y_ap, z_ap = approach
+        _, x_ap, y_ap, z_ap, _ap_info = approach
         fig.add_scatter3d(x=x_ap, y=y_ap, z=z_ap, mode="lines",
                            line=dict(color="cyan", width=5, dash="dash"),
                            name=f"カット終端アプローチ(推定, v={CUT_FEED_SPEED:.0f}mm/s)")
@@ -558,7 +578,7 @@ def main():
 
     plan = plan_hop(A, B, WAFER_CENTER, r_forbid, Z_SAFE)
     t, x, y, z = sample_plan(plan)
-    approach = compute_cut_approach(plan, CUT_FEED_SPEED, OVERTRAVEL)
+    approach = compute_cut_approach(plan, CUT_FEED_SPEED, OVERTRAVEL, XY_MARGIN)
 
     out_dir = os.path.dirname(os.path.abspath(__file__))
     write_csv(os.path.join(out_dir, "hop_commands.csv"), t, x, y, z)
@@ -581,13 +601,18 @@ def main():
     print(f"Z上昇/下降    : {plan.up_prof.T*1000:.1f} / {plan.down_prof.T*1000:.1f} ms")
     if plan.z_head > 0:
         print(f"Z先行上昇     : A到達の {plan.z_head*1000:.1f} ms 前に開始"
-              f"(カット終端オーバートラベル走行がこの時間以上あること)")
-        if len(approach[0]) > 0:
-            t_pre = -approach[0][0] * 1000
-            margin = t_pre - plan.z_head * 1000
-            print(f"カット終端アプローチ推定: 送り{CUT_FEED_SPEED:.0f}mm/s・"
-                  f"オーバートラベル{OVERTRAVEL:.0f}mmなら走行 {t_pre:.1f} ms "
-                  f"確保可能({'OK, 余裕' if margin >= 0 else '不足'} {margin:+.1f} ms)")
+              f"(禁止円内は等速カット走行中のため、この時間はウェハ全域の"
+              f"等速区間から自由に確保可能)")
+        if len(approach) == 5 and approach[4]:
+            info = approach[4]
+            ok = info["decel_ok"]
+            spare = (info["margin"] - info["d_dec"])
+            print(f"減速マージンチェック: 送り{CUT_FEED_SPEED:.0f}mm/s → 停止に"
+                  f"{info['d_dec']:.3f}mm必要 / 禁止円外マージン"
+                  f"{info['margin']:.1f}mm(=オーバートラベル{OVERTRAVEL:.0f}-"
+                  f"XYマージン{XY_MARGIN:.0f}) → "
+                  f"{'OK' if ok else 'NG! マージン不足'}"
+                  f"(余裕 {spare:+.2f}mm)")
     if plan.t_enter >= 0:
         print(f"円内通過区間  : {plan.t_enter*1000:.1f} - {plan.t_exit*1000:.1f} ms")
     if plan.down_tail > 0:
