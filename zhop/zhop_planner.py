@@ -124,6 +124,22 @@ def make_trapezoid(dist: float, vmax: float, amax: float) -> Trapezoid:
 # ホップ計画
 # ============================================================
 
+def compute_t_avail(v_cut: float, margin: float, amax_x: float):
+    """禁止円退出から margin[mm] を送り速度 v_cut で走り、amax_x で減速して
+    ちょうど停止するまでに使える時間[s]と、減速に使う距離[mm]を返す。
+
+    plan_hop()(実際の計画・xy_delay算出)と compute_cut_approach()(可視化)の
+    両方から呼ばれる、単一の計算根拠。
+    """
+    if v_cut <= 0.0 or margin <= 0.0:
+        return 0.0, 0.0
+    t_dec = v_cut / amax_x
+    d_dec = min(0.5 * v_cut * t_dec, margin)
+    d_coast = max(0.0, margin - d_dec)
+    t_avail = d_coast / v_cut + t_dec
+    return t_avail, d_dec
+
+
 @dataclass
 class HopPlan:
     A: tuple
@@ -132,11 +148,12 @@ class HopPlan:
     xy_dir: tuple          # 単位ベクトル
     up_prof: Trapezoid     # zA -> z_safe
     down_prof: Trapezoid   # z_safe -> zB
-    z_head: float          # Z上昇の先行開始時間(A到達の何s前に開始するか)
+    z_head: float          # Z上昇の先行開始時間(A出発の何s前に開始するか)
+    xy_delay: float        # 円退出→A停止だけでは z_head が足りない場合、Aで待つ時間
     t_down_start: float    # Z下降開始時刻(t=0 は XY開始 = A出発)
     t_enter: float         # 禁止円進入時刻(交差なしは -1)
     t_exit: float
-    total: float           # A出発からZ下降完了までの時間
+    total: float           # A出発からZ下降完了までの時間(xy_delay は含まない)
     total_sequential: float
 
     @property
@@ -145,7 +162,15 @@ class HopPlan:
         return max(0.0, self.t_down_start + self.down_prof.T - self.xy_prof.T)
 
 
-def plan_hop(A, B, center, r_forbid, z_safe) -> HopPlan:
+def plan_hop(A, B, center, r_forbid, z_safe, t_avail: float = math.inf) -> HopPlan:
+    """A->B のZホップを計画する。
+
+    t_avail: 「刃が禁止円を退出してからAで停止するまで」に実際に使える時間[s]
+    (compute_t_avail() で送り速度等から算出)。Z上昇に必要な先行時間(z_head)が
+    これを超える場合、超過分は Aに到着後の xy_delay(XY出発の遅延)として
+    計画に反映される。省略時(math.inf)は「常に間に合う」とみなし、
+    xy_delay は常に0になる(過去の簡易モデルと同じ挙動)。
+    """
     ax_, ay, az = A
     bx, by, bz = B
 
@@ -190,7 +215,7 @@ def plan_hop(A, B, center, r_forbid, z_safe) -> HopPlan:
         total = max(xy_prof.T, z_direct.T)
         return HopPlan(A, B, xy_prof, (ux, uy), z_direct,
                        make_trapezoid(0.0, VMAX["z"], AMAX["z"]),
-                       0.0, total, -1.0, -1.0, total, seq)
+                       0.0, 0.0, total, -1.0, -1.0, total, seq)
 
     t_enter_rel = xy_prof.time_at_s(s_enter)
     t_exit_rel = xy_prof.time_at_s(s_exit)
@@ -198,10 +223,15 @@ def plan_hop(A, B, center, r_forbid, z_safe) -> HopPlan:
     # Z上昇の先行開始(ユーザー承認済み):
     # 禁止円内は加工中(X等速・YZ固定)のため、Z上昇を開始できるのは刃が
     # 禁止円を退出した後(オーバートラベルのマージン区間)のみ。
-    # z_head = A到達の何s前に上昇開始が必要か。これが「円退出→A停止」の
-    # 走行時間(t_avail)に収まるかは compute_cut_approach() 側でチェックする。
-    # 収まる場合はXY開始遅延ゼロ。不足分は実機ではXY開始遅延として戻る。
+    # z_head = A出発の何s前にZ上昇を開始する必要があるか(A出発を基準に、
+    # そこから t_enter_rel 後に円へ再進入するまでにZ上昇を終える前提)。
     z_head = max(0.0, up_prof.T - t_enter_rel)
+
+    # z_head が「円退出→A停止」の走行時間 t_avail に収まらない場合、
+    # Z上昇はそれ以上早く開始できない(禁止円内は加工中のため)。
+    # 収まらない分は、Aに到着してからXY出発を遅らせて吸収する
+    # (Aで待つ間もZ上昇は継続する。実機での現実的な挙動)。
+    xy_delay = max(0.0, z_head - t_avail)
 
     # Z下降は円退出と同時に開始。XY完了後に残る下降テール(down_tail)は
     # 次ラインの助走(オーバートラベル)中に継続してよい(ユーザー承認済み)
@@ -209,15 +239,19 @@ def plan_hop(A, B, center, r_forbid, z_safe) -> HopPlan:
     total = max(xy_prof.T, t_down_start + down_prof.T)
 
     return HopPlan(A, B, xy_prof, (ux, uy), up_prof, down_prof,
-                   z_head, t_down_start, t_enter_rel, t_exit_rel,
+                   z_head, xy_delay, t_down_start, t_enter_rel, t_exit_rel,
                    total, seq)
 
 
 def sample_plan(plan: HopPlan, dt: float = RTEX_DT):
     """1ms周期で各軸位置をサンプリング
 
-    t=0 が XY開始(A出発)。z_head > 0 の場合は t<0 の行(Z先行上昇、XY増分ゼロ)
-    を含む。この区間の dz はカット終端の指令列に合成して使う。
+    t=0 が実際のXY出発(次ラインへ動き始める瞬間)。z_head > 0 の場合は
+    t<0 の行(XY増分ゼロ)を含み、この区間は物理的にAへの到着(t=-xy_delay)
+    より前後2つの意味を持つ:
+      - t < -xy_delay: まだAに到着していない(カット終端走行中、Z先行上昇)
+      - -xy_delay <= t < 0: Aに到着済みだがZ上昇待ちでXY出発を保留(xy_delay>0の場合のみ)
+    いずれもXY増分ゼロなので、この区間のdzはカット終端の指令列に合成して使う。
     """
     n_head = int(math.ceil(plan.z_head / dt))
     n_main = int(math.ceil(plan.total / dt)) + 1
@@ -255,19 +289,20 @@ def compute_cut_approach(plan: HopPlan, v_cut: float, overtravel: float, xy_marg
       - 禁止円内は加工中。X軸は等速 v_cut、Y・Z軸は一切動かせない(刃がウェハ内)
       - 刃が禁止円を出た後(x >= +r_forbid、幅 = overtravel - xy_margin のマージン)
         でのみ、Xの減速と Z上昇が可能
-    したがって Z先行(z_head)は「禁止円退出→A停止」の走行時間 t_avail
-    (= マージンを等速+減速で走り切る時間)に収まる必要がある(info["z_head_ok"])。
-    収まらない場合、不足分は実機ではXY開始遅延として戻る。
-    減速距離がマージンに収まるかも併せて判定する(info["decel_ok"])。
+    Z先行(z_head)が「禁止円退出→A停止」の走行時間 t_avail に収まらない場合、
+    plan.xy_delay > 0 (Aに到着後、XY出発を遅らせて待つ)が plan_hop() 側で
+    既に計算されている。ここではその plan.xy_delay を使い、sample_plan() と
+    同じ時間軸(t=0 が実際のXY出発)で出力を揃える。
     hop_commands.csv には反映しない(実際のX制御はカット側の指令列が担うため)。
     z_head=0(先行不要)の場合は空配列を返す。
 
     戻り値: t, x, y, z, info
-      t, x, y, z: t=0 が A到達、負の値が A到達より前(可視化用サンプル列。
-                  t < -t_avail の部分は加工中 = 禁止円内・Z固定)
+      t, x, y, z: t=0 が実際のXY出発(sample_plan と同一の基準)。
+                  A到達は t=-xy_delay、円退出(加工完了)は t=-xy_delay-t_avail。
       info: {"t_avail": 円退出→A停止の時間, "z_head_ok": z_headが収まるか,
              "head_margin": 時間余裕, "margin": マージン距離,
-             "d_dec": 停止に必要な距離, "decel_ok": 減速がマージンに収まるか}
+             "d_dec": 停止に必要な距離, "decel_ok": 減速がマージンに収まるか,
+             "xy_delay": Aで待つ時間}
     """
     if plan.z_head <= 0.0 or v_cut <= 0.0:
         empty = np.array([])
@@ -279,28 +314,26 @@ def compute_cut_approach(plan: HopPlan, v_cut: float, overtravel: float, xy_marg
 
     amax_x = AMAX["x"]
     margin = overtravel - xy_margin  # 禁止円退出からAまでの距離
-    t_dec = v_cut / amax_x
-    d_dec = 0.5 * v_cut * t_dec
+    t_avail, d_dec = compute_t_avail(v_cut, margin, amax_x)
     decel_ok = d_dec <= margin
-
-    # 禁止円退出(Z上昇解禁)から A 停止までに使える時間
-    d_coast_out = max(0.0, margin - d_dec)   # 円外での等速走行分
-    t_avail = d_coast_out / v_cut + t_dec
     z_head_ok = plan.z_head <= t_avail + 1e-12
+    xy_delay = plan.xy_delay  # plan_hop() で既に計算済み(t_avail不足分)
 
+    t_dec = v_cut / amax_x
     # 可視化区間: 円退出の display_lead 秒前(加工中)から A まで
+    d_coast_out = max(0.0, margin - d_dec)
     t_coast = d_coast_out / v_cut + display_lead  # 等速走行の総時間(加工中含む)
     T_pre = t_coast + t_dec
     total_dist = v_cut * t_coast + d_dec
 
     n = int(math.ceil(T_pre / dt))
-    t = -T_pre + dt * np.arange(n + 1)
-    t[-1] = 0.0  # A到達時刻を厳密に一致させる
+    t_local = -T_pre + dt * np.arange(n + 1)  # t_local=0 が A到達(このセグメント内の基準)
+    t_local[-1] = 0.0  # A到達時刻を厳密に一致させる
 
-    x = np.empty_like(t)
-    y = np.empty_like(t)
-    z = np.empty_like(t)
-    for i, ti in enumerate(t):
+    x = np.empty_like(t_local)
+    y = np.empty_like(t_local)
+    z = np.empty_like(t_local)
+    for i, ti in enumerate(t_local):
         s = ti + T_pre  # 区間開始からの経過時間 [0, T_pre]
         if s < t_coast:
             pos = v_cut * s
@@ -310,15 +343,20 @@ def compute_cut_approach(plan: HopPlan, v_cut: float, overtravel: float, xy_marg
         dist_remaining = total_dist - pos
         x[i] = ax_ - apx * dist_remaining
         y[i] = ay - apy * dist_remaining
-        # Z上昇は禁止円退出(ti >= -t_avail)後のみ。加工中(円内)は固定
+        # Z上昇は禁止円退出(ti >= -t_avail)後のみ。加工中(円内)は固定。
+        # sample_plan と同じ「実際のXY出発を基準」の時刻に揃えて up_prof を評価する
+        ti_shared = ti - xy_delay
         if ti >= -t_avail:
-            z[i] = az + plan.up_prof.s(ti + plan.z_head)
+            z[i] = az + plan.up_prof.s(ti_shared + plan.z_head)
         else:
             z[i] = az
 
+    t = t_local - xy_delay  # sample_plan と同じ基準(t=0=実際のXY出発)にシフト
+
     info = {"t_avail": t_avail, "z_head_ok": z_head_ok,
             "head_margin": t_avail - plan.z_head,
-            "margin": margin, "d_dec": d_dec, "decel_ok": decel_ok, "t_dec": t_dec}
+            "margin": margin, "d_dec": d_dec, "decel_ok": decel_ok, "t_dec": t_dec,
+            "xy_delay": xy_delay}
     return t, x, y, z, info
 
 
@@ -404,8 +442,14 @@ def plot_plan(plan: HopPlan, t, x, y, z, r_forbid, out_png,
     if plan.z_head > 0:
         a.axvspan(-plan.z_head * 1000, 0, color="tab:blue", alpha=0.10,
                   label="Z先行上昇(カット終端走行中)")
+    if plan.xy_delay > 0:
+        a.axvspan(-plan.xy_delay * 1000, 0, color="tab:red", alpha=0.12,
+                  label="A到着後、Z上昇待ちでXY出発を遅延")
+        a.axvline(-plan.xy_delay * 1000, color="tab:purple", lw=1, ls="-.",
+                  label="A到着(実際のXY出発はここより後)")
     if has_ap and _ap_info:
-        a.axvline(-_ap_info["t_avail"] * 1000, color="tab:red", lw=1, ls=":",
+        exit_t = -(plan.xy_delay + _ap_info["t_avail"]) * 1000
+        a.axvline(exit_t, color="tab:red", lw=1, ls=":",
                   label="刃が禁止円退出(これ以前は加工中・Z固定)")
     a.set_xlabel("t [ms]"); a.set_ylabel("位置 [mm]")
     a.set_title("位置指令(1ms周期、破線=カット終端アプローチ推定)")
@@ -589,7 +633,9 @@ def main():
     A = (x_end, y_line, CUT_DEPTH)
     B = (x_start, y_line + INDEX_PITCH, CUT_DEPTH)
 
-    plan = plan_hop(A, B, WAFER_CENTER, r_forbid, Z_SAFE)
+    margin = OVERTRAVEL - XY_MARGIN
+    t_avail, _ = compute_t_avail(CUT_FEED_SPEED, margin, AMAX["x"])
+    plan = plan_hop(A, B, WAFER_CENTER, r_forbid, Z_SAFE, t_avail=t_avail)
     t, x, y, z = sample_plan(plan)
     approach = compute_cut_approach(plan, CUT_FEED_SPEED, OVERTRAVEL, XY_MARGIN)
 
@@ -610,10 +656,11 @@ def main():
 
     print(f"A = {A}  ->  B = {B}")
     print(f"XY距離        : {plan.xy_prof.dist:.1f} mm")
-    print(f"XY移動時間    : {plan.xy_prof.T*1000:.1f} ms (開始遅延なし)")
+    print(f"XY移動時間    : {plan.xy_prof.T*1000:.1f} ms"
+          f" (A到着後の出発遅延 {plan.xy_delay*1000:.1f} ms)")
     print(f"Z上昇/下降    : {plan.up_prof.T*1000:.1f} / {plan.down_prof.T*1000:.1f} ms")
     if plan.z_head > 0:
-        print(f"Z先行上昇     : A到達の {plan.z_head*1000:.1f} ms 前に開始"
+        print(f"Z先行上昇     : XY出発の {plan.z_head*1000:.1f} ms 前に開始"
               f"(開始できるのは刃が禁止円を退出した後のみ)")
         if len(approach) == 5 and approach[4]:
             info = approach[4]
@@ -622,22 +669,27 @@ def main():
                   f"-XYマージン{XY_MARGIN:.0f} を送り{CUT_FEED_SPEED:.0f}mm/s"
                   f"等速+減速で走行)")
             print(f"z_head充足    : "
-                  f"{'OK' if info['z_head_ok'] else 'NG! 不足分はXY開始遅延として戻る'}"
+                  f"{'OK' if info['z_head_ok'] else 'NG(t_avail不足)'}"
                   f"(時間余裕 {info['head_margin']*1000:+.1f} ms)")
+            if plan.xy_delay > 0:
+                print(f"→ 不足分はAで待機してXY出発を遅延: "
+                      f"+{plan.xy_delay*1000:.1f} ms"
+                      f"(Aに到着してもZが上がりきるまで次ラインへは出発しない)")
             print(f"減速距離      : {info['d_dec']:.3f} mm → "
                   f"{'OK' if info['decel_ok'] else 'NG! マージン不足'}"
                   f"(マージン{info['margin']:.1f}mm 内)")
     if plan.t_enter >= 0:
-        print(f"円内通過区間  : {plan.t_enter*1000:.1f} - {plan.t_exit*1000:.1f} ms")
+        print(f"円内通過区間  : {plan.t_enter*1000:.1f} - {plan.t_exit*1000:.1f} ms"
+              f"(XY出発基準)")
     if plan.down_tail > 0:
         print(f"Z下降テール   : XY完了後 {plan.down_tail*1000:.1f} ms"
               f"(次ラインの助走中に下降継続可)")
     print(f"安全チェック  : {'NG! 円内で z < z_safe' if violation else 'OK(円内は常に z >= z_safe)'}")
-    print(f"── A→B所要(Z下降完了まで)   : {plan.total*1000:.1f} ms")
-    print(f"── 実効ライン間ロス(XY律速): {plan.xy_prof.T*1000:.1f} ms "
-          f"※Z先行上昇と下降テールを前後のカット走行に重ねた場合")
+    print(f"── A→B所要(Z下降完了まで、A到着起点): {(plan.xy_delay + plan.total)*1000:.1f} ms")
+    print(f"── 実効ライン間ロス(XY律速): {(plan.xy_delay + plan.xy_prof.T)*1000:.1f} ms "
+          f"※Aでの待機・Z先行上昇・下降テールを前後のカット走行に重ねた場合")
     print(f"── 参考: 逐次実行           : {plan.total_sequential*1000:.1f} ms")
-    print(f"出力: hop_commands.csv ({len(t)}行, t<0はZ先行上昇分), hop_plan.png, hop_plan_3d.png")
+    print(f"出力: hop_commands.csv ({len(t)}行, t<0はZ先行上昇/待機分), hop_plan.png, hop_plan_3d.png")
 
 
 if __name__ == "__main__":
