@@ -1,0 +1,3 @@
+numpy
+matplotlib
+plotly   # --show 使用時のみ必要(未インストールでもPNG出力は動作する)

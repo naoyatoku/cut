@@ -1,4 +1,5 @@
 __pycache__/
 *.pyc
 .venv/
-zhop/hop_plan_3d.html  # Plotly本体埋め込みで数MBになるため生成物として除外
+# Plotly本体埋め込みで数MBになるため生成物として除外
+zhop/hop_plan_3d.html
